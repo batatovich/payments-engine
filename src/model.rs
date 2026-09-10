@@ -53,3 +53,14 @@ pub struct Transaction {
     #[serde(default)]
     pub amount: Option<Amount>,
 }
+
+impl Transaction {
+    pub fn new(tx_type: TxType, client: ClientId, tx_id: TxId, amount: Option<Amount>) -> Self {
+        Self {
+            tx_type,
+            client,
+            tx_id,
+            amount,
+        }
+    }
+}

@@ -1,15 +1,10 @@
-//! The payments engine: the correctness-critical core of the program.
+//! The payments engine.
 //!
 //! The engine is deliberately decoupled from all I/O. It is fed already parsed
-//! [`Transaction`]s one at a time via [`PaymentsEngine::apply`], mutates its
+//! [`Transaction`]s one at a time via [`PaymentsEngine::process_transaction`], mutates its
 //! in-memory state, and can later be drained for output. Because it holds no
 //! file handles, sockets, or writers, the exact same engine can be driven by
 //! the CLI (one CSV file) or, in a server, by one instance per client stream.
-//!
-//! ## Ordering
-//! Transactions are applied strictly in the order they are handed to `apply`.
-//! The spec guarantees the input file is chronological, and disputes/resolves/
-//! chargebacks reference earlier transactions, so order must be preserved.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -59,6 +54,12 @@ impl PaymentsEngine {
     /// offending row can be logged and skipped, and processing continues with
     /// the next one.
     pub fn process_transaction(&mut self, transaction: &Transaction) -> Result<(), TxError> {
+        // A locked account is frozen: no transaction type may
+        // touch it, so reject up front before dispatching to a handler.
+        if matches!(self.accounts.get(&transaction.client), Some(account) if account.locked) {
+            return Err(TxError::new(transaction.tx_id, TxErrorKind::AccountLocked));
+        }
+
         match transaction.tx_type {
             TxType::Deposit => self.deposit(transaction),
             TxType::Withdrawal => self.withdrawal(transaction),
@@ -80,7 +81,6 @@ impl PaymentsEngine {
 
     fn deposit(&mut self, transaction: &Transaction) -> Result<(), TxError> {
         let amount = self.require_amount(transaction)?;
-        self.reject_if_locked(transaction.client, transaction.tx_id)?;
 
         // Record the deposit first so a duplicate tx id cannot silently
         // overwrite an existing disputable transaction.
@@ -104,7 +104,6 @@ impl PaymentsEngine {
 
     fn withdrawal(&mut self, transaction: &Transaction) -> Result<(), TxError> {
         let amount = self.require_amount(transaction)?;
-        self.reject_if_locked(transaction.client, transaction.tx_id)?;
 
         let account = self.accounts.entry(transaction.client).or_default();
         if account.available < amount {
@@ -118,7 +117,6 @@ impl PaymentsEngine {
     }
 
     fn dispute(&mut self, transaction: &Transaction) -> Result<(), TxError> {
-        self.reject_if_locked(transaction.client, transaction.tx_id)?;
         let deposit = self.disputable_deposit(transaction, DepositState::Confirmed)?;
         let amount = deposit.amount;
 
@@ -130,7 +128,6 @@ impl PaymentsEngine {
     }
 
     fn resolve(&mut self, transaction: &Transaction) -> Result<(), TxError> {
-        self.reject_if_locked(transaction.client, transaction.tx_id)?;
         let deposit = self.disputable_deposit(transaction, DepositState::Disputed)?;
         let amount = deposit.amount;
 
@@ -142,7 +139,6 @@ impl PaymentsEngine {
     }
 
     fn chargeback(&mut self, transaction: &Transaction) -> Result<(), TxError> {
-        self.reject_if_locked(transaction.client, transaction.tx_id)?;
         let deposit = self.disputable_deposit(transaction, DepositState::Disputed)?;
         let amount = deposit.amount;
 
@@ -168,9 +164,7 @@ impl PaymentsEngine {
     }
 
     /// Validate that a referenced deposit exists, belongs to the requesting
-    /// client, and is in the state required by the operation. Returns a clone
-    /// of the stored deposit so callers can read its amount without holding a
-    /// borrow on `self.deposits`.
+    /// client, and is in the state required by the operation.
     fn disputable_deposit(
         &self,
         transaction: &Transaction,
@@ -192,13 +186,356 @@ impl PaymentsEngine {
         }
         Ok(deposit.clone())
     }
+}
 
-    /// Reject any operation on a frozen account. A chargeback locks the account
-    /// permanently; we treat a locked account as fully frozen.
-    fn reject_if_locked(&self, client: ClientId, tx_id: TxId) -> Result<(), TxError> {
-        match self.accounts.get(&client) {
-            Some(account) if account.locked => Err(TxError::new(tx_id, TxErrorKind::AccountLocked)),
-            _ => Ok(()),
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- Test helpers -----------------------------------------------------
+
+    /// Parse a decimal amount from a string literal (panics on bad input).
+    fn amt(s: &str) -> Amount {
+        s.parse().expect("valid decimal literal in test")
+    }
+
+    /// Assert an `(available, held, locked)` snapshot for a client.
+    fn assert_balances(
+        engine: &PaymentsEngine,
+        client: ClientId,
+        available: &str,
+        held: &str,
+        locked: bool,
+    ) {
+        let account = engine
+            .accounts
+            .get(&client)
+            .expect("account should exist for client");
+        assert_eq!(
+            account.available,
+            amt(available),
+            "available for client {client}"
+        );
+        assert_eq!(account.held, amt(held), "held for client {client}");
+        assert_eq!(
+            account.total(),
+            amt(available) + amt(held),
+            "total invariant"
+        );
+        assert_eq!(account.locked, locked, "locked for client {client}");
+    }
+
+    /// Process a transaction, asserting it is successfully processed.
+    fn process_valid_transaction(engine: &mut PaymentsEngine, transaction: Transaction) {
+        engine
+            .process_transaction(&transaction)
+            .expect("transaction should succeed");
+    }
+
+    /// Process a transaction, asserting it is rejected with the given error.
+    fn process_invalid_transaction(
+        engine: &mut PaymentsEngine,
+        transaction: Transaction,
+        tx_id: TxId,
+        kind: TxErrorKind,
+    ) {
+        let e = engine
+            .process_transaction(&transaction)
+            .expect_err("transaction should be rejected");
+        assert_eq!(e, TxError::new(tx_id, kind));
+    }
+
+    // --- Happy-path scenarios --------------------------------------------
+
+    #[test]
+    fn deposit_credits_available_and_total() {
+        let mut engine = PaymentsEngine::new();
+        process_valid_transaction(
+            &mut engine,
+            Transaction::new(TxType::Deposit, 1, 1, Some(amt("1.0"))),
+        );
+        process_valid_transaction(
+            &mut engine,
+            Transaction::new(TxType::Deposit, 1, 2, Some(amt("2.5"))),
+        );
+        assert_balances(&engine, 1, "3.5", "0", false);
+    }
+
+    #[test]
+    fn withdrawal_debits_available_and_total() {
+        let mut engine = PaymentsEngine::new();
+        process_valid_transaction(
+            &mut engine,
+            Transaction::new(TxType::Deposit, 1, 1, Some(amt("5.0"))),
+        );
+        process_valid_transaction(
+            &mut engine,
+            Transaction::new(TxType::Withdrawal, 1, 2, Some(amt("2.0"))),
+        );
+        assert_balances(&engine, 1, "3.0", "0", false);
+    }
+
+    #[test]
+    fn clients_are_isolated() {
+        let mut engine = PaymentsEngine::new();
+        process_valid_transaction(
+            &mut engine,
+            Transaction::new(TxType::Deposit, 1, 1, Some(amt("1.0"))),
+        );
+        process_valid_transaction(
+            &mut engine,
+            Transaction::new(TxType::Deposit, 2, 2, Some(amt("2.0"))),
+        );
+        assert_balances(&engine, 1, "1.0", "0", false);
+        assert_balances(&engine, 2, "2.0", "0", false);
+    }
+
+    #[test]
+    fn dispute_holds_funds() {
+        let mut engine = PaymentsEngine::new();
+        process_valid_transaction(
+            &mut engine,
+            Transaction::new(TxType::Deposit, 1, 1, Some(amt("3.0"))),
+        );
+        process_valid_transaction(&mut engine, Transaction::new(TxType::Dispute, 1, 1, None));
+        // Available drops, held rises, total unchanged.
+        assert_balances(&engine, 1, "0", "3.0", false);
+    }
+
+    #[test]
+    fn resolve_releases_held_funds() {
+        let mut engine = PaymentsEngine::new();
+        process_valid_transaction(
+            &mut engine,
+            Transaction::new(TxType::Deposit, 1, 1, Some(amt("3.0"))),
+        );
+        process_valid_transaction(&mut engine, Transaction::new(TxType::Dispute, 1, 1, None));
+        process_valid_transaction(&mut engine, Transaction::new(TxType::Resolve, 1, 1, None));
+        assert_balances(&engine, 1, "3.0", "0", false);
+    }
+
+    #[test]
+    fn chargeback_withdraws_held_and_locks() {
+        let mut engine = PaymentsEngine::new();
+        process_valid_transaction(
+            &mut engine,
+            Transaction::new(TxType::Deposit, 1, 1, Some(amt("3.0"))),
+        );
+        process_valid_transaction(&mut engine, Transaction::new(TxType::Dispute, 1, 1, None));
+        process_valid_transaction(
+            &mut engine,
+            Transaction::new(TxType::Chargeback, 1, 1, None),
+        );
+        assert_balances(&engine, 1, "0", "0", true);
+    }
+
+    #[test]
+    fn dispute_can_be_reopened_after_resolve() {
+        let mut engine = PaymentsEngine::new();
+        process_valid_transaction(
+            &mut engine,
+            Transaction::new(TxType::Deposit, 1, 1, Some(amt("4.0"))),
+        );
+        process_valid_transaction(&mut engine, Transaction::new(TxType::Dispute, 1, 1, None));
+        process_valid_transaction(&mut engine, Transaction::new(TxType::Resolve, 1, 1, None));
+        // A resolved deposit returns to Confirmed and may be disputed again.
+        process_valid_transaction(&mut engine, Transaction::new(TxType::Dispute, 1, 1, None));
+        assert_balances(&engine, 1, "0", "4.0", false);
+    }
+
+    // --- TxError flows ----------------------------------------------------
+
+    #[test]
+    fn deposit_missing_amount_is_rejected() {
+        let mut engine = PaymentsEngine::new();
+        process_invalid_transaction(
+            &mut engine,
+            Transaction::new(TxType::Deposit, 1, 1, None),
+            1,
+            TxErrorKind::MissingAmount,
+        );
+        assert!(engine.accounts.get(&1).is_none());
+    }
+
+    #[test]
+    fn deposit_negative_amount_is_rejected() {
+        let mut engine = PaymentsEngine::new();
+        process_invalid_transaction(
+            &mut engine,
+            Transaction::new(TxType::Deposit, 1, 1, Some(amt("-1.0"))),
+            1,
+            TxErrorKind::NegativeAmount,
+        );
+    }
+
+    #[test]
+    fn duplicate_tx_id_is_rejected() {
+        let mut engine = PaymentsEngine::new();
+        process_valid_transaction(
+            &mut engine,
+            Transaction::new(TxType::Deposit, 1, 1, Some(amt("1.0"))),
+        );
+        process_invalid_transaction(
+            &mut engine,
+            Transaction::new(TxType::Deposit, 1, 1, Some(amt("2.0"))),
+            1,
+            TxErrorKind::DuplicateTx,
+        );
+        // The duplicate must not have altered the balance.
+        assert_balances(&engine, 1, "1.0", "0", false);
+    }
+
+    #[test]
+    fn withdrawal_insufficient_funds_is_rejected() {
+        let mut engine = PaymentsEngine::new();
+        process_valid_transaction(
+            &mut engine,
+            Transaction::new(TxType::Deposit, 1, 1, Some(amt("1.0"))),
+        );
+        process_invalid_transaction(
+            &mut engine,
+            Transaction::new(TxType::Withdrawal, 1, 2, Some(amt("5.0"))),
+            2,
+            TxErrorKind::InsufficientFunds,
+        );
+        // Balance is unchanged after a failed withdrawal.
+        assert_balances(&engine, 1, "1.0", "0", false);
+    }
+
+    #[test]
+    fn withdrawal_missing_amount_is_rejected() {
+        let mut engine = PaymentsEngine::new();
+        process_invalid_transaction(
+            &mut engine,
+            Transaction::new(TxType::Withdrawal, 1, 1, None),
+            1,
+            TxErrorKind::MissingAmount,
+        );
+    }
+
+    #[test]
+    fn dispute_unknown_tx_is_rejected() {
+        let mut engine = PaymentsEngine::new();
+        process_invalid_transaction(
+            &mut engine,
+            Transaction::new(TxType::Dispute, 1, 99, None),
+            99,
+            TxErrorKind::UnknownTx,
+        );
+    }
+
+    #[test]
+    fn dispute_wrong_client_is_rejected() {
+        let mut engine = PaymentsEngine::new();
+        process_valid_transaction(
+            &mut engine,
+            Transaction::new(TxType::Deposit, 1, 1, Some(amt("1.0"))),
+        );
+        // Client 2 tries to dispute client 1's deposit.
+        process_invalid_transaction(
+            &mut engine,
+            Transaction::new(TxType::Dispute, 2, 1, None),
+            1,
+            TxErrorKind::ClientMismatch,
+        );
+        assert_balances(&engine, 1, "1.0", "0", false);
+    }
+
+    #[test]
+    fn dispute_already_disputed_is_ineligible() {
+        let mut engine = PaymentsEngine::new();
+        process_valid_transaction(
+            &mut engine,
+            Transaction::new(TxType::Deposit, 1, 1, Some(amt("1.0"))),
+        );
+        process_valid_transaction(&mut engine, Transaction::new(TxType::Dispute, 1, 1, None));
+        process_invalid_transaction(
+            &mut engine,
+            Transaction::new(TxType::Dispute, 1, 1, None),
+            1,
+            TxErrorKind::IneligibleState,
+        );
+    }
+
+    #[test]
+    fn resolve_undisputed_is_ineligible() {
+        let mut engine = PaymentsEngine::new();
+        process_valid_transaction(
+            &mut engine,
+            Transaction::new(TxType::Deposit, 1, 1, Some(amt("1.0"))),
+        );
+        process_invalid_transaction(
+            &mut engine,
+            Transaction::new(TxType::Resolve, 1, 1, None),
+            1,
+            TxErrorKind::IneligibleState,
+        );
+    }
+
+    #[test]
+    fn chargeback_undisputed_is_ineligible() {
+        let mut engine = PaymentsEngine::new();
+        process_valid_transaction(
+            &mut engine,
+            Transaction::new(TxType::Deposit, 1, 1, Some(amt("1.0"))),
+        );
+        process_invalid_transaction(
+            &mut engine,
+            Transaction::new(TxType::Chargeback, 1, 1, None),
+            1,
+            TxErrorKind::IneligibleState,
+        );
+    }
+
+    #[test]
+    fn cannot_dispute_after_chargeback() {
+        let mut engine = PaymentsEngine::new();
+        process_valid_transaction(
+            &mut engine,
+            Transaction::new(TxType::Deposit, 1, 1, Some(amt("1.0"))),
+        );
+        process_valid_transaction(&mut engine, Transaction::new(TxType::Dispute, 1, 1, None));
+        process_valid_transaction(
+            &mut engine,
+            Transaction::new(TxType::Chargeback, 1, 1, None),
+        );
+        // A chargeback locks the account, so the lock check short-circuits
+        // before the deposit's terminal `ChargedBack` state is ever inspected:
+        // the caller sees `AccountLocked`, not `IneligibleState`.
+        process_invalid_transaction(
+            &mut engine,
+            Transaction::new(TxType::Dispute, 1, 1, None),
+            1,
+            TxErrorKind::AccountLocked,
+        );
+    }
+
+    #[test]
+    fn locked_account_rejects_further_transactions() {
+        let mut engine = PaymentsEngine::new();
+        process_valid_transaction(
+            &mut engine,
+            Transaction::new(TxType::Deposit, 1, 1, Some(amt("1.0"))),
+        );
+        process_valid_transaction(&mut engine, Transaction::new(TxType::Dispute, 1, 1, None));
+        process_valid_transaction(
+            &mut engine,
+            Transaction::new(TxType::Chargeback, 1, 1, None),
+        );
+
+        // Every operation on a locked account is refused.
+        process_invalid_transaction(
+            &mut engine,
+            Transaction::new(TxType::Deposit, 1, 2, Some(amt("5.0"))),
+            2,
+            TxErrorKind::AccountLocked,
+        );
+        process_invalid_transaction(
+            &mut engine,
+            Transaction::new(TxType::Withdrawal, 1, 3, Some(amt("1.0"))),
+            3,
+            TxErrorKind::AccountLocked,
+        );
+        assert_balances(&engine, 1, "0", "0", true);
     }
 }
