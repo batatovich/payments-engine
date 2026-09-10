@@ -28,6 +28,9 @@ pub enum TxType {
     Chargeback,
 }
 
+/// The number of decimal places all amounts are rounded/scaled to.
+pub const DECIMAL_PLACES: u32 = 4;
+
 /// Convenience constructor for the zero amount.
 #[inline]
 pub fn zero() -> Decimal {
