@@ -52,7 +52,7 @@ pub fn run<R: Read, W: Write>(input: R, output: W) -> Result<(), AppError> {
         // consistent with the spec's "assume this is a partner error" guidance.
         match raw.deserialize::<Transaction>(Some(&headers)) {
             Ok(transaction) => {
-                // A recoverable TxError means "skip this row and continue".
+                // A recoverable ProcessingError means "skip this row and continue".
                 let _ = engine.process_transaction(&transaction);
             }
             Err(_) => continue,

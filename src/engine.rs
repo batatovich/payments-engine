@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 
 use crate::account::Account;
-use crate::error::{TxError, TxErrorKind};
+use crate::error::{ProcessingError, ProcessingErrorKind};
 use crate::model::{Amount, ClientId, Transaction, TxId, TxType};
 
 /// Lifecycle of a disputable transaction (a deposit).
@@ -50,14 +50,20 @@ impl PaymentsEngine {
 
     /// Process a single transaction, mutating account state.
     ///
-    /// Returns `Ok(())` on success. A returned [`TxError`] is recoverable: the
+    /// Returns `Ok(())` on success. A returned [`ProcessingError`] is recoverable: the
     /// offending row can be logged and skipped, and processing continues with
     /// the next one.
-    pub fn process_transaction(&mut self, transaction: &Transaction) -> Result<(), TxError> {
+    pub fn process_transaction(
+        &mut self,
+        transaction: &Transaction,
+    ) -> Result<(), ProcessingError> {
         // A locked account is frozen: no transaction type may
         // touch it, so reject up front before dispatching to a handler.
         if matches!(self.accounts.get(&transaction.client), Some(account) if account.locked) {
-            return Err(TxError::new(transaction.tx_id, TxErrorKind::AccountLocked));
+            return Err(ProcessingError::new(
+                transaction.tx_id,
+                ProcessingErrorKind::AccountLocked,
+            ));
         }
 
         match transaction.tx_type {
@@ -79,14 +85,17 @@ impl PaymentsEngine {
 
     // --- Handlers ---------------------------------------------------------
 
-    fn deposit(&mut self, transaction: &Transaction) -> Result<(), TxError> {
+    fn deposit(&mut self, transaction: &Transaction) -> Result<(), ProcessingError> {
         let amount = self.require_amount(transaction)?;
 
         // Record the deposit first so a duplicate tx id cannot silently
         // overwrite an existing disputable transaction.
         match self.deposits.entry(transaction.tx_id) {
             Entry::Occupied(_) => {
-                return Err(TxError::new(transaction.tx_id, TxErrorKind::DuplicateTx));
+                return Err(ProcessingError::new(
+                    transaction.tx_id,
+                    ProcessingErrorKind::DuplicateTx,
+                ));
             }
             Entry::Vacant(slot) => {
                 slot.insert(Deposit {
@@ -102,21 +111,21 @@ impl PaymentsEngine {
         Ok(())
     }
 
-    fn withdrawal(&mut self, transaction: &Transaction) -> Result<(), TxError> {
+    fn withdrawal(&mut self, transaction: &Transaction) -> Result<(), ProcessingError> {
         let amount = self.require_amount(transaction)?;
 
         let account = self.accounts.entry(transaction.client).or_default();
         if account.available < amount {
-            return Err(TxError::new(
+            return Err(ProcessingError::new(
                 transaction.tx_id,
-                TxErrorKind::InsufficientFunds,
+                ProcessingErrorKind::InsufficientFunds,
             ));
         }
         account.available -= amount;
         Ok(())
     }
 
-    fn dispute(&mut self, transaction: &Transaction) -> Result<(), TxError> {
+    fn dispute(&mut self, transaction: &Transaction) -> Result<(), ProcessingError> {
         let deposit = self.disputable_deposit(transaction, DepositState::Confirmed)?;
         let amount = deposit.amount;
 
@@ -127,7 +136,7 @@ impl PaymentsEngine {
         Ok(())
     }
 
-    fn resolve(&mut self, transaction: &Transaction) -> Result<(), TxError> {
+    fn resolve(&mut self, transaction: &Transaction) -> Result<(), ProcessingError> {
         let deposit = self.disputable_deposit(transaction, DepositState::Disputed)?;
         let amount = deposit.amount;
 
@@ -138,7 +147,7 @@ impl PaymentsEngine {
         Ok(())
     }
 
-    fn chargeback(&mut self, transaction: &Transaction) -> Result<(), TxError> {
+    fn chargeback(&mut self, transaction: &Transaction) -> Result<(), ProcessingError> {
         let deposit = self.disputable_deposit(transaction, DepositState::Disputed)?;
         let amount = deposit.amount;
 
@@ -153,12 +162,15 @@ impl PaymentsEngine {
 
     /// Extract the amount from a transaction that requires one, rejecting
     /// missing or negative values.
-    fn require_amount(&self, transaction: &Transaction) -> Result<Amount, TxError> {
-        let amount = transaction
-            .amount
-            .ok_or_else(|| TxError::new(transaction.tx_id, TxErrorKind::MissingAmount))?;
+    fn require_amount(&self, transaction: &Transaction) -> Result<Amount, ProcessingError> {
+        let amount = transaction.amount.ok_or_else(|| {
+            ProcessingError::new(transaction.tx_id, ProcessingErrorKind::MissingAmount)
+        })?;
         if amount.is_sign_negative() {
-            return Err(TxError::new(transaction.tx_id, TxErrorKind::NegativeAmount));
+            return Err(ProcessingError::new(
+                transaction.tx_id,
+                ProcessingErrorKind::NegativeAmount,
+            ));
         }
         Ok(amount)
     }
@@ -169,19 +181,21 @@ impl PaymentsEngine {
         &self,
         transaction: &Transaction,
         required: DepositState,
-    ) -> Result<Deposit, TxError> {
-        let deposit = self
-            .deposits
-            .get(&transaction.tx_id)
-            .ok_or_else(|| TxError::new(transaction.tx_id, TxErrorKind::UnknownTx))?;
+    ) -> Result<Deposit, ProcessingError> {
+        let deposit = self.deposits.get(&transaction.tx_id).ok_or_else(|| {
+            ProcessingError::new(transaction.tx_id, ProcessingErrorKind::UnknownTx)
+        })?;
 
         if deposit.client != transaction.client {
-            return Err(TxError::new(transaction.tx_id, TxErrorKind::ClientMismatch));
+            return Err(ProcessingError::new(
+                transaction.tx_id,
+                ProcessingErrorKind::ClientMismatch,
+            ));
         }
         if deposit.state != required {
-            return Err(TxError::new(
+            return Err(ProcessingError::new(
                 transaction.tx_id,
-                TxErrorKind::IneligibleState,
+                ProcessingErrorKind::IneligibleState,
             ));
         }
         Ok(deposit.clone())
@@ -237,12 +251,12 @@ mod tests {
         engine: &mut PaymentsEngine,
         transaction: Transaction,
         tx_id: TxId,
-        kind: TxErrorKind,
+        kind: ProcessingErrorKind,
     ) {
         let e = engine
             .process_transaction(&transaction)
             .expect_err("transaction should be rejected");
-        assert_eq!(e, TxError::new(tx_id, kind));
+        assert_eq!(e, ProcessingError::new(tx_id, kind));
     }
 
     // --- Happy-path scenarios --------------------------------------------
@@ -343,7 +357,7 @@ mod tests {
         assert_balances(&engine, 1, "0", "4.0", false);
     }
 
-    // --- TxError flows ----------------------------------------------------
+    // --- ProcessingError flows ----------------------------------------------------
 
     #[test]
     fn deposit_missing_amount_is_rejected() {
@@ -352,7 +366,7 @@ mod tests {
             &mut engine,
             Transaction::new(TxType::Deposit, 1, 1, None),
             1,
-            TxErrorKind::MissingAmount,
+            ProcessingErrorKind::MissingAmount,
         );
         assert!(engine.accounts.get(&1).is_none());
     }
@@ -364,7 +378,7 @@ mod tests {
             &mut engine,
             Transaction::new(TxType::Deposit, 1, 1, Some(amt("-1.0"))),
             1,
-            TxErrorKind::NegativeAmount,
+            ProcessingErrorKind::NegativeAmount,
         );
     }
 
@@ -379,7 +393,7 @@ mod tests {
             &mut engine,
             Transaction::new(TxType::Deposit, 1, 1, Some(amt("2.0"))),
             1,
-            TxErrorKind::DuplicateTx,
+            ProcessingErrorKind::DuplicateTx,
         );
         // The duplicate must not have altered the balance.
         assert_balances(&engine, 1, "1.0", "0", false);
@@ -396,7 +410,7 @@ mod tests {
             &mut engine,
             Transaction::new(TxType::Withdrawal, 1, 2, Some(amt("5.0"))),
             2,
-            TxErrorKind::InsufficientFunds,
+            ProcessingErrorKind::InsufficientFunds,
         );
         // Balance is unchanged after a failed withdrawal.
         assert_balances(&engine, 1, "1.0", "0", false);
@@ -409,7 +423,7 @@ mod tests {
             &mut engine,
             Transaction::new(TxType::Withdrawal, 1, 1, None),
             1,
-            TxErrorKind::MissingAmount,
+            ProcessingErrorKind::MissingAmount,
         );
     }
 
@@ -420,7 +434,7 @@ mod tests {
             &mut engine,
             Transaction::new(TxType::Dispute, 1, 99, None),
             99,
-            TxErrorKind::UnknownTx,
+            ProcessingErrorKind::UnknownTx,
         );
     }
 
@@ -436,7 +450,7 @@ mod tests {
             &mut engine,
             Transaction::new(TxType::Dispute, 2, 1, None),
             1,
-            TxErrorKind::ClientMismatch,
+            ProcessingErrorKind::ClientMismatch,
         );
         assert_balances(&engine, 1, "1.0", "0", false);
     }
@@ -453,7 +467,7 @@ mod tests {
             &mut engine,
             Transaction::new(TxType::Dispute, 1, 1, None),
             1,
-            TxErrorKind::IneligibleState,
+            ProcessingErrorKind::IneligibleState,
         );
     }
 
@@ -468,7 +482,7 @@ mod tests {
             &mut engine,
             Transaction::new(TxType::Resolve, 1, 1, None),
             1,
-            TxErrorKind::IneligibleState,
+            ProcessingErrorKind::IneligibleState,
         );
     }
 
@@ -483,7 +497,7 @@ mod tests {
             &mut engine,
             Transaction::new(TxType::Chargeback, 1, 1, None),
             1,
-            TxErrorKind::IneligibleState,
+            ProcessingErrorKind::IneligibleState,
         );
     }
 
@@ -506,7 +520,7 @@ mod tests {
             &mut engine,
             Transaction::new(TxType::Dispute, 1, 1, None),
             1,
-            TxErrorKind::AccountLocked,
+            ProcessingErrorKind::AccountLocked,
         );
     }
 
@@ -528,13 +542,13 @@ mod tests {
             &mut engine,
             Transaction::new(TxType::Deposit, 1, 2, Some(amt("5.0"))),
             2,
-            TxErrorKind::AccountLocked,
+            ProcessingErrorKind::AccountLocked,
         );
         process_invalid_transaction(
             &mut engine,
             Transaction::new(TxType::Withdrawal, 1, 3, Some(amt("1.0"))),
             3,
-            TxErrorKind::AccountLocked,
+            ProcessingErrorKind::AccountLocked,
         );
         assert_balances(&engine, 1, "0", "0", true);
     }
