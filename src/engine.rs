@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 
 use crate::account::Account;
+use crate::error::{TxError, TxErrorKind};
 use crate::model::{Amount, ClientId, Transaction, TxId, TxType};
 
 /// Lifecycle of a disputable transaction (a deposit).
@@ -54,10 +55,10 @@ impl PaymentsEngine {
 
     /// Apply a single transaction, mutating account state.
     ///
-    /// Invalid transactions (bad amounts, unknown references, ineligible
-    /// states, locked accounts) are silently skipped and processing continues
-    /// with the next one.
-    pub fn apply(&mut self, transaction: &Transaction) {
+    /// Returns `Ok(())` on success. A returned [`TxError`] is recoverable: the
+    /// offending row can be logged and skipped, and processing continues with
+    /// the next one.
+    pub fn apply(&mut self, transaction: &Transaction) -> Result<(), TxError> {
         match transaction.tx_type {
             TxType::Deposit => self.deposit(transaction),
             TxType::Withdrawal => self.withdrawal(transaction),
@@ -77,23 +78,15 @@ impl PaymentsEngine {
 
     // --- Handlers ---------------------------------------------------------
 
-    fn deposit(&mut self, transaction: &Transaction) {
-        let Some(amount) = transaction.amount else {
-            // TODO: add error
-            return;
-        };
-
-        if self.is_locked(transaction.client) {
-            // TODO: add error
-            return;
-        }
+    fn deposit(&mut self, transaction: &Transaction) -> Result<(), TxError> {
+        let amount = self.require_amount(transaction)?;
+        self.reject_if_locked(transaction.client, transaction.tx_id)?;
 
         // Record the deposit first so a duplicate tx id cannot silently
         // overwrite an existing disputable transaction.
         match self.deposits.entry(transaction.tx_id) {
             Entry::Occupied(_) => {
-                // TODO: add error
-                return;
+                return Err(TxError::new(transaction.tx_id, TxErrorKind::DuplicateTx));
             }
             Entry::Vacant(slot) => {
                 slot.insert(Deposit {
@@ -106,78 +99,73 @@ impl PaymentsEngine {
 
         let account = self.accounts.entry(transaction.client).or_default();
         account.available += amount;
+        Ok(())
     }
 
-    fn withdrawal(&mut self, transaction: &Transaction) {
-        let Some(amount) = transaction.amount else {
-            // TODO: add error
-            return;
-        };
-        if self.is_locked(transaction.client) {
-            // TODO: add error
-            return;
-        }
+    fn withdrawal(&mut self, transaction: &Transaction) -> Result<(), TxError> {
+        let amount = self.require_amount(transaction)?;
+        self.reject_if_locked(transaction.client, transaction.tx_id)?;
 
         let account = self.accounts.entry(transaction.client).or_default();
         if account.available < amount {
-            // TODO: add error
-            return;
+            return Err(TxError::new(
+                transaction.tx_id,
+                TxErrorKind::InsufficientFunds,
+            ));
         }
         account.available -= amount;
+        Ok(())
     }
 
-    fn dispute(&mut self, transaction: &Transaction) {
-        if self.is_locked(transaction.client) {
-            // TODO: add error
-            return;
-        }
-        let Some(deposit) = self.disputable_deposit(transaction, DepositState::Confirmed) else {
-            // TODO: add error
-            return;
-        };
+    fn dispute(&mut self, transaction: &Transaction) -> Result<(), TxError> {
+        self.reject_if_locked(transaction.client, transaction.tx_id)?;
+        let deposit = self.disputable_deposit(transaction, DepositState::Confirmed)?;
         let amount = deposit.amount;
 
         let account = self.accounts.entry(transaction.client).or_default();
         account.available -= amount;
         account.held += amount;
         self.deposits.get_mut(&transaction.tx_id).unwrap().state = DepositState::Disputed;
+        Ok(())
     }
 
-    fn resolve(&mut self, transaction: &Transaction) {
-        if self.is_locked(transaction.client) {
-            // TODO: add error
-            return;
-        }
-        let Some(deposit) = self.disputable_deposit(transaction, DepositState::Disputed) else {
-            // TODO: add error
-            return;
-        };
+    fn resolve(&mut self, transaction: &Transaction) -> Result<(), TxError> {
+        self.reject_if_locked(transaction.client, transaction.tx_id)?;
+        let deposit = self.disputable_deposit(transaction, DepositState::Disputed)?;
         let amount = deposit.amount;
 
         let account = self.accounts.entry(transaction.client).or_default();
         account.held -= amount;
         account.available += amount;
         self.deposits.get_mut(&transaction.tx_id).unwrap().state = DepositState::Confirmed;
+        Ok(())
     }
 
-    fn chargeback(&mut self, transaction: &Transaction) {
-        if self.is_locked(transaction.client) {
-            // TODO: add error
-            return;
-        }
-        let Some(deposit) = self.disputable_deposit(transaction, DepositState::Disputed) else {
-            // TODO: add error
-            return;
-        };
+    fn chargeback(&mut self, transaction: &Transaction) -> Result<(), TxError> {
+        self.reject_if_locked(transaction.client, transaction.tx_id)?;
+        let deposit = self.disputable_deposit(transaction, DepositState::Disputed)?;
         let amount = deposit.amount;
 
         let account = self.accounts.entry(transaction.client).or_default();
         account.held -= amount;
         account.locked = true;
         self.deposits.get_mut(&transaction.tx_id).unwrap().state = DepositState::ChargedBack;
+        Ok(())
     }
 
     // --- Helpers ----------------------------------------------------------
+
+    /// Extract the amount from a transaction that requires one, rejecting
+    /// missing or negative values.
+    fn require_amount(&self, transaction: &Transaction) -> Result<Amount, TxError> {
+        let amount = transaction
+            .amount
+            .ok_or_else(|| TxError::new(transaction.tx_id, TxErrorKind::MissingAmount))?;
+        if amount.is_sign_negative() {
+            return Err(TxError::new(transaction.tx_id, TxErrorKind::NegativeAmount));
+        }
+        Ok(amount)
+    }
 
     /// Validate that a referenced deposit exists, belongs to the requesting
     /// client, and is in the state required by the operation. Returns a clone
@@ -187,21 +175,30 @@ impl PaymentsEngine {
         &self,
         transaction: &Transaction,
         required: DepositState,
-    ) -> Option<Deposit> {
-        let deposit = self.deposits.get(&transaction.tx_id)?;
+    ) -> Result<Deposit, TxError> {
+        let deposit = self
+            .deposits
+            .get(&transaction.tx_id)
+            .ok_or_else(|| TxError::new(transaction.tx_id, TxErrorKind::UnknownTx))?;
 
         if deposit.client != transaction.client {
-            return None;
+            return Err(TxError::new(transaction.tx_id, TxErrorKind::ClientMismatch));
         }
         if deposit.state != required {
-            return None;
+            return Err(TxError::new(
+                transaction.tx_id,
+                TxErrorKind::IneligibleState,
+            ));
         }
-        Some(deposit.clone())
+        Ok(deposit.clone())
     }
 
-    /// Report whether an account is frozen. A chargeback locks the account
+    /// Reject any operation on a frozen account. A chargeback locks the account
     /// permanently; we treat a locked account as fully frozen.
-    fn is_locked(&self, client: ClientId) -> bool {
-        matches!(self.accounts.get(&client), Some(account) if account.locked)
+    fn reject_if_locked(&self, client: ClientId, tx_id: TxId) -> Result<(), TxError> {
+        match self.accounts.get(&client) {
+            Some(account) if account.locked => Err(TxError::new(tx_id, TxErrorKind::AccountLocked)),
+            _ => Ok(()),
+        }
     }
 }
