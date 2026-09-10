@@ -53,12 +53,12 @@ impl PaymentsEngine {
         Self::default()
     }
 
-    /// Apply a single transaction, mutating account state.
+    /// Process a single transaction, mutating account state.
     ///
     /// Returns `Ok(())` on success. A returned [`TxError`] is recoverable: the
     /// offending row can be logged and skipped, and processing continues with
     /// the next one.
-    pub fn apply(&mut self, transaction: &Transaction) -> Result<(), TxError> {
+    pub fn process_transaction(&mut self, transaction: &Transaction) -> Result<(), TxError> {
         match transaction.tx_type {
             TxType::Deposit => self.deposit(transaction),
             TxType::Withdrawal => self.withdrawal(transaction),
