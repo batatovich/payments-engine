@@ -1,6 +1,6 @@
 //! The per-client account and its balance invariants.
 
-use crate::model::{Amount, zero};
+use crate::model::{Amount, ClientId, DECIMAL_PLACES, zero};
 
 /// A client's account.
 ///
@@ -31,5 +31,29 @@ impl Account {
     #[inline]
     pub fn total(&self) -> Amount {
         self.available + self.held
+    }
+}
+
+/// Output account record: `client, available, held, total, locked`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AccountRecord {
+    pub client: ClientId,
+    pub available: Amount,
+    pub held: Amount,
+    pub total: Amount,
+    pub locked: bool,
+}
+
+impl AccountRecord {
+    /// Build an output record from a client's account, scaling every monetary
+    /// value to the required output precision.
+    pub fn from_account(client: ClientId, account: &Account) -> Self {
+        AccountRecord {
+            client,
+            available: account.available.round_dp(DECIMAL_PLACES),
+            held: account.held.round_dp(DECIMAL_PLACES),
+            total: account.total().round_dp(DECIMAL_PLACES),
+            locked: account.locked,
+        }
     }
 }
