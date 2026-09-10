@@ -36,3 +36,20 @@ pub const DECIMAL_PLACES: u32 = 4;
 pub fn zero() -> Decimal {
     Decimal::ZERO
 }
+
+/// A transaction record: `transaction type, client, transaction id, amount`.
+///
+/// `amount` is optional because dispute/resolve/chargeback rows reference a
+/// transaction by ID and carry no amount column value.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct Transaction {
+    #[serde(rename = "type")]
+    pub tx_type: TxType,
+    pub client: ClientId,
+    #[serde(rename = "tx")]
+    pub tx_id: TxId,
+    /// Parsed from a string so trailing whitespace / empty fields are handled
+    /// gracefully; `None` for transactions that omit the amount.
+    #[serde(default)]
+    pub amount: Option<Amount>,
+}
