@@ -30,10 +30,6 @@ use crate::model::Transaction;
 /// distinct clients and disputable transactions rather than the size of the
 /// input. This is what allows the same code to handle a small sample file or a
 /// never-ending network stream.
-///
-/// Per the specification, malformed rows and logically invalid operations
-/// (e.g. insufficient funds, disputing an unknown transaction) are skipped
-/// rather than aborting the run.
 pub fn run<R: Read, W: Write>(input: R, output: W) -> Result<(), AppError> {
     let mut reader = ReaderBuilder::new()
         // Tolerate the spaces in `deposit, 1, 1, 1.0` and around headers.

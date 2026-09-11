@@ -1,10 +1,4 @@
 //! The payments engine.
-//!
-//! The engine is deliberately decoupled from all I/O. It is fed already parsed
-//! [`Transaction`]s one at a time via [`PaymentsEngine::process_transaction`], mutates its
-//! in-memory state, and can later be drained for output. Because it holds no
-//! file handles, sockets, or writers, the exact same engine can be driven by
-//! the CLI (one CSV file) or, in a server, by one instance per client stream.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;

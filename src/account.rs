@@ -45,8 +45,7 @@ pub struct AccountRecord {
 }
 
 impl AccountRecord {
-    /// Build an output record from a client's account, scaling every monetary
-    /// value to the required output precision.
+    /// Build an output record from a client's account.
     pub fn from_account(client: ClientId, account: &Account) -> Self {
         AccountRecord {
             client,

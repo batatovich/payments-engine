@@ -1,8 +1,5 @@
 //! End-to-end tests driving the full CSV -> engine -> CSV pipeline via the
 //! public [`payments_engine::run`] entry point.
-//!
-//! Output row ordering is unspecified, so results are parsed into a map keyed by
-//! client id before comparison.
 
 use std::collections::BTreeMap;
 
