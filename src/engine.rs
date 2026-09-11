@@ -11,7 +11,7 @@ use std::collections::hash_map::Entry;
 
 use crate::account::Account;
 use crate::error::{ProcessingError, ProcessingErrorKind};
-use crate::model::{Amount, ClientId, Transaction, TxId, TxType};
+use crate::model::{Amount, ClientId, DECIMAL_PLACES, Transaction, TxId, TxType};
 
 /// Lifecycle of a disputable transaction (a deposit).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,6 +162,11 @@ impl PaymentsEngine {
 
     /// Extract the amount from a transaction that requires one, rejecting
     /// missing or negative values.
+    ///
+    /// The engine works at a fixed precision of [`DECIMAL_PLACES`] places, so
+    /// every amount is normalized to that precision **on ingest**. All balances
+    /// are then derived from these normalized amounts, keeping internal state at
+    /// 4 dp at all times.
     fn require_amount(&self, transaction: &Transaction) -> Result<Amount, ProcessingError> {
         let amount = transaction.amount.ok_or_else(|| {
             ProcessingError::new(transaction.tx_id, ProcessingErrorKind::MissingAmount)
@@ -172,7 +177,7 @@ impl PaymentsEngine {
                 ProcessingErrorKind::NegativeAmount,
             ));
         }
-        Ok(amount)
+        Ok(amount.round_dp(DECIMAL_PLACES))
     }
 
     /// Validate that a referenced deposit exists, belongs to the requesting
@@ -273,6 +278,24 @@ mod tests {
             Transaction::new(TxType::Deposit, 1, 2, Some(amt("2.5"))),
         );
         assert_balances(&engine, 1, "3.5", "0", false);
+    }
+
+    #[test]
+    fn amounts_are_normalized_to_four_places_on_ingest() {
+        let mut engine = PaymentsEngine::new();
+        // More than four decimal places is normalized to 4 dp as it enters the
+        // engine, so internal balances never carry extra precision.
+        process_valid_transaction(
+            &mut engine,
+            Transaction::new(TxType::Deposit, 1, 1, Some(amt("1.00005"))),
+        );
+        // 1.00005 -> 1.0000 (round half-to-even).
+        assert_eq!(engine.accounts.get(&1).unwrap().available, amt("1.0000"));
+        assert_eq!(engine.deposits.get(&1).unwrap().amount, amt("1.0000"));
+
+        // A subsequent dispute holds exactly the normalized amount.
+        process_valid_transaction(&mut engine, Transaction::new(TxType::Dispute, 1, 1, None));
+        assert_balances(&engine, 1, "0", "1.0000", false);
     }
 
     #[test]
