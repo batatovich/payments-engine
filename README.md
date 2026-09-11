@@ -72,15 +72,6 @@ from all I/O:
    partner error" guidance. Only environment-level failures (missing argument,
    unreadable file, broken CSV stream) abort the run.
 
-## Efficiency
-
-- Input is streamed: the `csv` reader yields records lazily and each row is
-  processed as it arrives (a single reused `StringRecord` buffer, no
-  `Vec<Transaction>`). Memory is bounded by the number of distinct clients and
-  retained deposits, not by input size, so the program handles a small sample or
-  an effectively unbounded stream the same way.
-- Both input and output are buffered (`BufReader` / `BufWriter`).
-
 ## Testing
 
 - **Unit tests** (in `engine.rs`) cover every transaction type and error path:
